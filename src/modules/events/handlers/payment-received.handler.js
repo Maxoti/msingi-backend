@@ -1,216 +1,443 @@
+'use strict';
+
 /**
  * Payment Received Event Handler
- * Handles actions when a payment is received (e.g., send receipt, update records)
- * Uses sms_logs table (not notification_logs)
+ * File: src/modules/events/handlers/payment-received.handler.js
+ *
+ * Listens for two events emitted by mpesa.service.js:
+ *
+ *  1. EventBus.Events.PAYMENT_RECEIVED  (alias: 'payment:received')
+ *     ─ Fired by autoReconcile() AFTER a payment row is created and linked
+ *       to an invoice. At this point we have full payment + student + invoice
+ *       context. We send a detailed receipt SMS.
+ *     Payload shape:
+ *       { paymentId, studentId, invoiceId, schoolId, amount, referenceNumber }
+ *
+ *  2. 'mpesa:callback:received'  (fired immediately on webhook arrival)
+ *     ─ Fired by processCallback() as soon as a COMPLETED transaction is
+ *       confirmed, BEFORE reconciliation. We send a quick "we got your money"
+ *       SMS to the paying phone number so the parent isn't left waiting.
+ *     Payload shape:
+ *       { transactionDbId, schoolId, amount, receiptNumber,
+ *         phoneNumber, accountReference }
+ *
+ * SMS provider contract (sms.service.js):
+ *   smsService.sendSMS(phoneNumber: string, message: string, options?: object)
+ *
+ * Design principles:
+ *   • Every DB call is school-scoped.
+ *   • SMS failures NEVER throw — they are logged and swallowed so a failed
+ *     SMS never rolls back a payment.
+ *   • All formatting helpers are pure functions — easy to test in isolation.
+ *   • No business logic lives inside event handlers; they are thin
+ *     orchestrators that delegate to services.
  */
 
 const smsService = require('../../notifications/sms/sms.service');
-const db = require('../../../shared/database/client');
+const db         = require('../../../shared/database/client');
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const FALLBACK_SCHOOL_NAME  = 'Your School';
+const FALLBACK_PARENT_NAME  = 'Parent';
+
+// ─── Pure helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Handle payment received event
- * @param {Object} data - Event data
- * @param {number} data.paymentId - Payment ID
- * @param {number} data.studentId - Student ID
- * @param {number} data.invoiceId - Invoice ID
- * @param {number} data.amount - Payment amount
- * @param {string} data.paymentMethod - Payment method (MPESA, CASH, BANK, etc.)
- * @param {string} data.referenceNumber - Payment reference number
+ * Format a number to 2 d.p. string, e.g. 1000 → "1,000.00"
  */
-const handlePaymentReceived = async (data) => {
+const fmt = (n) =>
+  Number(n || 0).toLocaleString('en-KE', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+/**
+ * Build the receipt SMS sent after full reconciliation.
+ * Keeps the tone warm, matches real M-PESA message brevity.
+ */
+const buildReceiptMessage = ({
+  parentName,
+  studentName,
+  admissionNo,
+  amount,
+  referenceNumber,
+  totalPaid,
+  totalAmount,
+  balance,
+  schoolName,
+}) => {
+  const fullyPaid = parseFloat(balance) <= 0;
+
+  const balanceLine = fullyPaid
+    ? 'Invoice fully settled.'
+    : `Balance: KES ${fmt(balance)}.`;
+
+  return (
+    `Dear ${parentName}, KES ${fmt(amount)} received for ` +
+    `${studentName} (${admissionNo}). ` +
+    `Ref: ${referenceNumber}. ` +
+    `Paid: KES ${fmt(totalPaid)} of KES ${fmt(totalAmount)}. ` +
+    `${balanceLine} ` +
+    `Thank you. - ${schoolName}`
+  );
+};
+
+/**
+ * Build the instant M-PESA confirmation SMS (pre-reconciliation).
+ * Sent the moment Safaricom's webhook fires — before invoice matching.
+ */
+const buildMpesaConfirmationMessage = ({
+  parentName,
+  studentName,
+  amount,
+  receiptNumber,
+  schoolName,
+}) =>
+  `Dear ${parentName}, your M-PESA payment of KES ${fmt(amount)} ` +
+  `for ${studentName} (Ref: ${receiptNumber}) has been received. ` +
+  `It will be applied to your account shortly. ` +
+  `Thank you. - ${schoolName}`;
+
+/**
+ * Build the "fully paid" congratulations SMS.
+ */
+const buildFullyPaidMessage = ({
+  parentName,
+  studentFirstName,
+  term,
+  year,
+  schoolName,
+}) =>
+  `Dear ${parentName}, congratulations! ` +
+  `${studentFirstName}'s fees for Term ${term} ${year} are now fully paid. ` +
+  `Thank you for your prompt payment. - ${schoolName}`;
+
+// ─── DB helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the school name for an SMS signature.
+ * Falls back gracefully — a missing school name must never suppress an SMS.
+ */
+const fetchSchoolName = async (schoolId) => {
+  if (!schoolId) return FALLBACK_SCHOOL_NAME;
   try {
-    console.log('💸 [EVENT] Payment Received:', data);
-
-    const { paymentId, studentId, invoiceId, amount, paymentMethod, referenceNumber } = data;
-
-    // Get payment details with student and invoice info
-    const paymentDetails = await db.queryOne(
-      `SELECT 
-         p.id as payment_id,
-         p.amount,
-         p.payment_method,
-         p.reference_number,
-         p.payment_date,
-         s.id as student_id,
-         s.first_name,
-         s.last_name,
-         s.admission_no,
-         c.name as class_name,
-         i.id as invoice_id,
-         i.total_amount,
-         i.status as invoice_status,
-         at.term,
-         at.year,
-         pc.name as parent_name,
-         pc.phone as parent_phone,
-         COALESCE(SUM(all_payments.amount), 0) as total_paid,
-         (i.total_amount - COALESCE(SUM(all_payments.amount), 0)) as balance
-       FROM payments p
-       JOIN invoices i ON i.id = p.invoice_id
-       JOIN students s ON s.id = i.student_id
-       JOIN classes c ON c.id = s.class_id
-       JOIN academic_terms at ON at.id = i.term_id
-       LEFT JOIN parent_contacts pc ON pc.student_id = s.id AND pc.is_primary = TRUE
-       LEFT JOIN payments all_payments ON all_payments.invoice_id = i.id
-       WHERE p.id = $1
-       GROUP BY p.id, s.id, c.id, i.id, at.id, pc.name, pc.phone`,
-      [paymentId]
+    const row = await db.queryOne(
+      `SELECT name FROM schools WHERE id = $1`,
+      [schoolId]
     );
+    return row?.name?.trim() || FALLBACK_SCHOOL_NAME;
+  } catch (err) {
+    console.warn(`[handler] Could not fetch school name (id=${schoolId}):`, err.message);
+    return FALLBACK_SCHOOL_NAME;
+  }
+};
 
-    if (!paymentDetails) {
-      console.error(` Payment ${paymentId} not found`);
+/**
+ * Fetch full payment details needed for a receipt SMS.
+ * Uses a single JOIN query — no N+1 calls.
+ *
+ * Returns null if the payment row is not found.
+ */
+const fetchPaymentDetails = async (paymentId) =>
+  db.queryOne(
+    `SELECT
+       p.id                                                AS payment_id,
+       p.amount,
+       p.payment_method,
+       p.reference_number,
+       p.payment_date,
+       -- student
+       s.id                                               AS student_id,
+       s.school_id,
+       s.first_name,
+       s.last_name,
+       s.admission_no,
+       -- class / term
+       c.name                                             AS class_name,
+       at.term,
+       at.year,
+       -- invoice totals
+       i.id                                               AS invoice_id,
+       i.total_amount,
+       i.status                                           AS invoice_status,
+       -- primary parent contact
+       pc.name                                            AS parent_name,
+       pc.phone                                           AS parent_phone,
+       -- running totals (all payments on this invoice, including this one)
+       COALESCE(SUM(all_p.amount), 0)                    AS total_paid,
+       (i.total_amount - COALESCE(SUM(all_p.amount), 0)) AS balance
+     FROM payments p
+     JOIN invoices       i   ON i.id  = p.invoice_id
+     JOIN students       s   ON s.id  = i.student_id
+     JOIN classes        c   ON c.id  = s.class_id
+     JOIN academic_terms at  ON at.id = i.term_id
+     LEFT JOIN parent_contacts pc
+       ON pc.student_id = s.id AND pc.is_primary = TRUE
+     LEFT JOIN payments all_p
+       ON all_p.invoice_id = i.id
+     WHERE p.id = $1
+     GROUP BY p.id, s.id, c.id, i.id, at.id, pc.name, pc.phone`,
+    [paymentId]
+  );
+
+/**
+ * Fetch the student + primary parent contact for a given admission_no / schoolId.
+ * Used in the instant M-PESA confirmation path (pre-reconciliation).
+ *
+ * Returns null if the student is not found.
+ */
+const fetchStudentByAdmission = async (admissionNo, schoolId) =>
+  db.queryOne(
+    `SELECT
+       s.id,
+       s.first_name,
+       s.last_name,
+       s.admission_no,
+       pc.name  AS parent_name,
+       pc.phone AS parent_phone
+     FROM students s
+     LEFT JOIN parent_contacts pc
+       ON pc.student_id = s.id AND pc.is_primary = TRUE
+     WHERE s.admission_no = $1
+       AND s.school_id    = $2`,
+    [admissionNo, schoolId]
+  );
+
+// ─── SMS helper ───────────────────────────────────────────────────────────────
+
+/**
+ * Send an SMS and swallow any error so that a provider failure never
+ * propagates up and interferes with the payment flow.
+ */
+const safeSendSMS = async (phone, message, options, logLabel) => {
+  try {
+    const result = await smsService.sendSMS(phone, message, options);
+    if (result.success) {
+      console.log(`✓ [handler] SMS sent (${logLabel}) → ${phone}`);
+    } else {
+      console.warn(`⚠ [handler] SMS not sent (${logLabel}):`, result.error || result.status);
+    }
+    return result;
+  } catch (err) {
+    console.error(`✗ [handler] SMS threw (${logLabel}):`, err.message);
+    return { success: false, error: err.message };
+  }
+};
+
+// ─── Event handler: post-reconciliation receipt ───────────────────────────────
+
+/**
+ * handlePaymentReceived
+ *
+ * Triggered AFTER autoReconcile() or manualReconcile() creates a payment row
+ * and links it to an invoice (EventBus.Events.PAYMENT_RECEIVED).
+ *
+ * Sends:
+ *   1. A detailed receipt SMS with running totals and outstanding balance.
+ *   2. A congratulations SMS if the invoice is now fully settled.
+ *
+ * Expected payload:
+ *   { paymentId: number }
+ *   (schoolId, studentId, invoiceId are resolved from the DB to avoid
+ *    trusting caller-supplied values for scoping.)
+ */
+const handlePaymentReceived = async ({ paymentId } = {}) => {
+  const label = `handlePaymentReceived(paymentId=${paymentId})`;
+
+  try {
+    if (!paymentId) {
+      console.error(`✗ [handler] ${label}: missing paymentId`);
+      return { success: false, error: 'Missing paymentId' };
+    }
+
+    console.log(`▶ [handler] ${label}`);
+
+    // ── 1. Fetch everything we need in one query ──────────────────────────
+    const pd = await fetchPaymentDetails(paymentId);
+
+    if (!pd) {
+      console.error(`✗ [handler] ${label}: payment not found`);
       return { success: false, error: 'Payment not found' };
     }
 
-    console.log(` Sending payment receipt to parent: ${paymentDetails.parent_phone}`);
+    const schoolName  = await fetchSchoolName(pd.school_id);
+    const parentPhone = pd.parent_phone;
 
-    // Send SMS receipt to parent
-    if (paymentDetails.parent_phone) {
-      const paidAmount = parseFloat(paymentDetails.amount).toFixed(2);
-      const balance = parseFloat(paymentDetails.balance).toFixed(2);
-      const totalPaid = parseFloat(paymentDetails.total_paid).toFixed(2);
-      const totalAmount = parseFloat(paymentDetails.total_amount).toFixed(2);
-      const paymentDate = new Date(paymentDetails.payment_date).toLocaleDateString('en-GB');
-
-      let message = `Dear ${paymentDetails.parent_name || 'Parent'}, we confirm receipt of KES ${paidAmount} for ${paymentDetails.first_name} ${paymentDetails.last_name} (${paymentDetails.admission_no}). `;
-      
-      message += `Ref: ${paymentDetails.reference_number}. `;
-      message += `Total Paid: KES ${totalPaid}/${totalAmount}. `;
-      
-      if (parseFloat(balance) > 0) {
-        message += `Balance: KES ${balance}. `;
-      } else {
-        message += `Fully paid. `;
-      }
-      
-      message += `Thank you. - Msingi School`;
-
-      try {
-        await smsService.sendSMS({
-          to: paymentDetails.parent_phone,
-          message,
-          context: {
-            type: 'PAYMENT_RECEIPT',
-            paymentId,
-            invoiceId,
-            studentId,
-            amount: paidAmount
-          }
-        });
-        console.log(` Payment receipt sent to ${paymentDetails.parent_phone}`);
-      } catch (smsError) {
-        console.error(`Failed to send receipt SMS:`, smsError.message);
-      }
-    } else {
-      console.warn(`  No parent phone number for student ${studentId}`);
+    if (!parentPhone) {
+      console.warn(`⚠ [handler] ${label}: no parent phone for student ${pd.student_id}`);
+      return { success: false, error: 'No parent phone number on record' };
     }
 
-    // Note: sms_logs table is populated by smsService.sendSMS() automatically
-    // No need to manually insert here
+    const studentName = `${pd.first_name} ${pd.last_name}`;
+    const parentName  = pd.parent_name || FALLBACK_PARENT_NAME;
 
-    // If invoice is now fully paid, send congratulations message
-    if (parseFloat(paymentDetails.balance) <= 0 && paymentDetails.parent_phone) {
-      try {
-        const congrats = `Dear ${paymentDetails.parent_name || 'Parent'}, congratulations! ${paymentDetails.first_name}'s fees for Term ${paymentDetails.term}/${paymentDetails.year} are now fully paid. Thank you for your prompt payment. - Msingi School`;
-        
-        await smsService.sendSMS({
-          to: paymentDetails.parent_phone,
-          message: congrats,
-          context: {
-            type: 'FEES_FULLY_PAID',
-            invoiceId,
-            studentId
-          }
-        });
-        console.log(`🎉 Full payment congratulations sent`);
-      } catch (err) {
-        console.error(`Failed to send congratulations SMS:`, err.message);
-      }
+    // ── 2. Receipt SMS ────────────────────────────────────────────────────
+    const receiptMsg = buildReceiptMessage({
+      parentName,
+      studentName,
+      admissionNo:     pd.admission_no,
+      amount:          pd.amount,
+      referenceNumber: pd.reference_number,
+      totalPaid:       pd.total_paid,
+      totalAmount:     pd.total_amount,
+      balance:         pd.balance,
+      schoolName,
+    });
+
+    await safeSendSMS(
+      parentPhone,
+      receiptMsg,
+      {
+        messageType: 'PAYMENT_CONFIRMATION',
+        studentId:   pd.student_id,
+        invoiceId:   pd.invoice_id,
+        paymentId:   pd.payment_id,
+      },
+      'RECEIPT'
+    );
+
+    // ── 3. Congratulations SMS (only when fully paid) ─────────────────────
+    if (parseFloat(pd.balance) <= 0) {
+      const congratsMsg = buildFullyPaidMessage({
+        parentName,
+        studentFirstName: pd.first_name,
+        term:             pd.term,
+        year:             pd.year,
+        schoolName,
+      });
+
+      await safeSendSMS(
+        parentPhone,
+        congratsMsg,
+        {
+          messageType: 'GENERAL',
+          studentId:   pd.student_id,
+          invoiceId:   pd.invoice_id,
+          paymentId:   pd.payment_id,
+        },
+        'FULLY_PAID'
+      );
     }
 
     return {
-      success: true,
-      receiptSent: !!paymentDetails.parent_phone,
-      studentName: `${paymentDetails.first_name} ${paymentDetails.last_name}`,
-      amountPaid: parseFloat(paymentDetails.amount),
-      balance: parseFloat(paymentDetails.balance)
+      success:     true,
+      studentName,
+      amountPaid:  parseFloat(pd.amount),
+      balance:     parseFloat(pd.balance),
+      schoolName,
     };
 
-  } catch (error) {
-    console.error(' [EVENT] Error handling payment received event:', error);
-    throw error;
+  } catch (err) {
+    // Do not rethrow — a handler crash must never affect the payment record.
+    console.error(`✗ [handler] ${label} unhandled error:`, err);
+    return { success: false, error: err.message };
   }
 };
 
+// ─── Event handler: instant M-PESA confirmation (pre-reconciliation) ──────────
+
 /**
- * Handle M-Pesa payment confirmation (specialized handler for M-Pesa payments)
- * @param {Object} data - M-Pesa payment data
+ * handleMpesaPaymentReceived
+ *
+ * Triggered immediately when processCallback() marks a transaction COMPLETED,
+ * BEFORE autoReconcile() runs. The goal is speed — the parent should receive
+ * an SMS within seconds of paying, not after reconciliation completes.
+ *
+ * If the paying phone belongs to the registered parent we use that number;
+ * otherwise we fall back to the phone that initiated the STK push.
+ *
+ * Expected payload (from mpesa.service.js → processCallback):
+ *   {
+ *     transactionDbId:  number,   // mpesa_transactions.id
+ *     schoolId:         number,
+ *     amount:           number,
+ *     receiptNumber:    string,   // MpesaReceiptNumber or fallback ref
+ *     phoneNumber:      string,   // phone that initiated STK push
+ *     accountReference: string,   // admission_no used as bill reference
+ *   }
  */
-const handleMpesaPaymentReceived = async (data) => {
+const handleMpesaPaymentReceived = async ({
+  transactionDbId,
+  schoolId,
+  amount,
+  receiptNumber,
+  phoneNumber,
+  accountReference,
+} = {}) => {
+  const label = `handleMpesaPaymentReceived(txId=${transactionDbId}, ref=${receiptNumber})`;
+
   try {
-    console.log(' [EVENT] M-Pesa Payment Received:', data);
+    console.log(`▶ [handler] ${label}`);
 
-    const { transactionId, mpesaReceiptNumber, amount, phoneNumber, studentId } = data;
+    // ── 1. Validate required fields ───────────────────────────────────────
+    if (!schoolId || !accountReference) {
+      console.error(`✗ [handler] ${label}: missing schoolId or accountReference`);
+      return { success: false, error: 'Missing required payload fields' };
+    }
 
-    // Get student and parent details
-    const student = await db.queryOne(
-      `SELECT 
-         s.id,
-         s.first_name,
-         s.last_name,
-         s.admission_no,
-         pc.name as parent_name,
-         pc.phone as parent_phone
-       FROM students s
-       LEFT JOIN parent_contacts pc ON pc.student_id = s.id AND pc.is_primary = TRUE
-       WHERE s.id = $1`,
-      [studentId]
-    );
+    // ── 2. Fetch student + school name in parallel ────────────────────────
+    const [student, schoolName] = await Promise.all([
+      fetchStudentByAdmission(accountReference, schoolId),
+      fetchSchoolName(schoolId),
+    ]);
 
     if (!student) {
-      console.error(` Student ${studentId} not found`);
+      // Not a fatal error — the transaction is already saved; reconciliation
+      // will retry. But we cannot send an SMS without a student record.
+      console.warn(
+        `⚠ [handler] ${label}: student not found ` +
+        `(admission_no=${accountReference}, school=${schoolId}). SMS skipped.`
+      );
       return { success: false, error: 'Student not found' };
     }
 
-    // Send immediate confirmation SMS
-    const parentPhone = student.parent_phone || phoneNumber;
-    
-    if (parentPhone) {
-      const paidAmount = parseFloat(amount).toFixed(2);
-      const message = `Dear ${student.parent_name || 'Parent'}, your M-Pesa payment of KES ${paidAmount} for ${student.first_name} has been received. Receipt: ${mpesaReceiptNumber}. Payment will be allocated to your account shortly. Thank you. - Msingi School`;
+    // ── 3. Resolve recipient phone ────────────────────────────────────────
+    // Prefer the registered parent contact; fall back to the paying phone.
+    const recipientPhone = student.parent_phone || phoneNumber;
 
-      try {
-        await smsService.sendSMS({
-          to: parentPhone,
-          message,
-          context: {
-            type: 'MPESA_CONFIRMATION',
-            transactionId,
-            mpesaReceiptNumber,
-            studentId,
-            amount: paidAmount
-          }
-        });
-        console.log(` M-Pesa confirmation sent to ${parentPhone}`);
-      } catch (smsError) {
-        console.error(`Failed to send M-Pesa confirmation:`, smsError.message);
-      }
+    if (!recipientPhone) {
+      console.warn(`⚠ [handler] ${label}: no phone available. SMS skipped.`);
+      return { success: false, error: 'No phone number available' };
     }
 
+    const studentName = `${student.first_name} ${student.last_name}`;
+    const parentName  = student.parent_name || FALLBACK_PARENT_NAME;
+
+    // ── 4. Send confirmation SMS ──────────────────────────────────────────
+    const message = buildMpesaConfirmationMessage({
+      parentName,
+      studentName,
+      amount,
+      receiptNumber,
+      schoolName,
+    });
+
+    await safeSendSMS(
+      recipientPhone,
+      message,
+      {
+        messageType:        'PAYMENT_CONFIRMATION',
+        studentId:          student.id,
+        mpesaTransactionId: transactionDbId,
+      },
+      'MPESA_INSTANT'
+    );
+
     return {
-      success: true,
-      confirmationSent: !!parentPhone,
-      mpesaReceiptNumber,
-      amount: parseFloat(amount)
+      success:            true,
+      confirmationSent:   true,
+      schoolName,
+      mpesaReceiptNumber: receiptNumber,
+      amount:             parseFloat(amount),
     };
 
-  } catch (error) {
-    console.error(' [EVENT] Error handling M-Pesa payment:', error);
-    throw error;
+  } catch (err) {
+    console.error(`✗ [handler] ${label} unhandled error:`, err);
+    return { success: false, error: err.message };
   }
 };
 
-module.exports = {
-  handlePaymentReceived,
-  handleMpesaPaymentReceived
-};
+// ─── Exports ──────────────────────────────────────────────────────────────────
+
+module.exports = { handlePaymentReceived, handleMpesaPaymentReceived };

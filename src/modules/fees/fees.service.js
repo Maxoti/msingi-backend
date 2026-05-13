@@ -1,130 +1,148 @@
 /**
- * Fees Service
- * schoolId threaded through every operation for multi-tenancy
+ * fees.service.js
+ *
+ * Business logic for the fees module.
+ * All operations are explicitly scoped to schoolId for multi-tenancy.
+ *
+ * Responsibilities:
+ *  - Validate inputs and business rules before touching the DB.
+ *  - Orchestrate multi-step operations inside transactions.
+ *  - Never expose raw DB rows — shape responses for controllers.
+ *  - Never catch errors: let them propagate to the controller error handler.
  */
 
 'use strict';
 
-const feesRepository = require('./fees.repository');
-const db = require('../../shared/database/client');
+const repo = require('./fees.repository');
+const db   = require('../../shared/database/client');
 
-const createInvoice = async (studentIdentifier, term_id, items, created_by, schoolId) => {
-  const isNumericId = Number.isInteger(studentIdentifier) ||
-    (typeof studentIdentifier === 'string' && /^\d+$/.test(studentIdentifier));
+// ─── Invoices ─────────────────────────────────────────────────────────────────
 
-  const studentRow = isNumericId
-    ? await db.schoolQueryOne(schoolId, 'SELECT id FROM students WHERE id = $1', [studentIdentifier])
+/**
+ * Create a single invoice for one student.
+ * studentIdentifier may be a numeric DB id or an admission_no string.
+ */
+const createInvoice = async (studentIdentifier, termId, items, createdBy, schoolId) => {
+  // Resolve student
+  const isId     = Number.isInteger(studentIdentifier) ||
+                   (typeof studentIdentifier === 'string' && /^\d+$/.test(studentIdentifier));
+  const studentRow = isId
+    ? await db.schoolQueryOne(schoolId, 'SELECT id FROM students WHERE id = $1',           [studentIdentifier])
     : await db.schoolQueryOne(schoolId, 'SELECT id FROM students WHERE admission_no = $1', [studentIdentifier]);
 
   if (!studentRow) throw new Error('Student not found');
-  const student_id = studentRow.id;
 
-  const term = await db.schoolQueryOne(schoolId, 'SELECT id FROM academic_terms WHERE id = $1', [term_id]);
+  // Validate term
+  const term = await db.schoolQueryOne(
+    schoolId, 'SELECT id FROM academic_terms WHERE id = $1', [termId],
+  );
   if (!term) throw new Error('Term not found');
 
-  const existing = await feesRepository.findInvoiceByStudentAndTerm(schoolId, student_id, term_id);
-  if (existing) throw new Error('Invoice already exists for this student and term');
+  // Prevent duplicates
+  const duplicate = await repo.findInvoiceByStudentAndTerm(schoolId, studentRow.id, termId);
+  if (duplicate)  throw new Error('Invoice already exists for this student and term');
 
-  const total_amount = items.reduce((sum, item) => sum + parseFloat(item.amount), 0);
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('At least one fee item is required');
+  }
+
+  const totalAmount = items.reduce((sum, item) => sum + parseFloat(item.amount), 0);
 
   const invoice = await db.schoolTransaction(schoolId, async (client) => {
     const { rows: [newInvoice] } = await client.query(
       `INSERT INTO invoices (student_id, term_id, total_amount, status, school_id)
-       VALUES ($1,$2,$3,'UNPAID',$4) RETURNING *`,
-      [student_id, term_id, total_amount, schoolId]
+       VALUES ($1, $2, $3, 'UNPAID', $4)
+       RETURNING *`,
+      [studentRow.id, termId, totalAmount, schoolId],
     );
 
-    if (items.length > 0) {
-      const placeholders = items.map((_, i) => `($${i*4+1},$${i*4+2},$${i*4+3},$${i*4+4})`).join(', ');
-      const itemParams   = items.flatMap(({ description, amount }) => [newInvoice.id, description, parseFloat(amount), schoolId]);
-      await client.query(
-        `INSERT INTO invoice_items (invoice_id, description, amount, school_id) VALUES ${placeholders}`,
-        itemParams
-      );
-    }
+    // Bulk-insert line items in one query
+    const placeholders = items.map((_, i) =>
+      `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`,
+    ).join(', ');
+
+    const itemParams = items.flatMap(({ description, amount }) => [
+      newInvoice.id, description, parseFloat(amount), schoolId,
+    ]);
+
+    await client.query(
+      `INSERT INTO invoice_items (invoice_id, description, amount, school_id)
+       VALUES ${placeholders}`,
+      itemParams,
+    );
+
     return newInvoice;
   });
 
-  return feesRepository.findInvoiceByIdWithItems(schoolId, invoice.id);
+  // Return full invoice with items and joins
+  return repo.findInvoiceByIdWithItems(schoolId, invoice.id);
 };
 
 /**
- * generateInvoice
- * Bulk-generates invoices for all students in a class for a given term,
- * using the fee structure items defined for that class/term.
- *
- * Body: { class_id, term_id, created_by }
- *
- * - Skips students who already have an invoice for the term
- * - Returns a summary: how many created, how many skipped
+ * Bulk-generate invoices for every student in a class for a given term.
+ * Uses the fee structure defined for that class/term as line items.
+ * Skips students who already have an invoice for the term.
  */
-const generateInvoice = async (data, schoolId) => {
-  const { class_id, term_id, created_by } = data;
+const generateInvoices = async ({ class_id, term_id }, schoolId) => {
+  if (!class_id) throw new Error('class_id is required');
+  if (!term_id)  throw new Error('term_id is required');
 
-  if (!class_id)  throw new Error('class_id is required');
-  if (!term_id)   throw new Error('term_id is required');
+  const [term, classRow] = await Promise.all([
+    db.schoolQueryOne(schoolId, 'SELECT id FROM academic_terms WHERE id = $1', [term_id]),
+    db.schoolQueryOne(schoolId, 'SELECT id FROM classes WHERE id = $1',        [class_id]),
+  ]);
 
-  // Validate term exists
-  const term = await db.schoolQueryOne(
-    schoolId,
-    'SELECT id FROM academic_terms WHERE id = $1',
-    [term_id]
-  );
-  if (!term) throw new Error('Term not found');
-
-  // Validate class exists
-  const classRow = await db.schoolQueryOne(
-    schoolId,
-    'SELECT id FROM classes WHERE id = $1',
-    [class_id]
-  );
+  if (!term)     throw new Error('Term not found');
   if (!classRow) throw new Error('Class not found');
 
-  // Get fee structure items for this class + term
-  const feeItems = await feesRepository.findFeeStructureItems(schoolId, class_id, term_id);
-  if (!feeItems || feeItems.length === 0)
-    throw new Error('No fee structure found for this class and term. Set up a fee structure first.');
+  const feeItems = await repo.findFeeStructureItems(schoolId, class_id, term_id);
+  if (!feeItems?.length) {
+    throw new Error(
+      'No fee structure found for this class and term. Set up a fee structure first.',
+    );
+  }
 
-  const total_amount = feeItems.reduce((sum, item) => sum + parseFloat(item.amount), 0);
-
-  // Get all active students in the class
   const students = await db.schoolQuery(
-    schoolId,
-    `SELECT id FROM students WHERE class_id = $1`,
-    [class_id]
+    schoolId, 'SELECT id FROM students WHERE class_id = $1 AND is_active = true', [class_id],
   );
-  if (!students || students.length === 0)
-    throw new Error('No active students found in this class');
+  if (!students?.length) throw new Error('No active students found in this class');
+
+  const totalAmount = feeItems.reduce((sum, item) => sum + parseFloat(item.amount), 0);
 
   let created = 0;
   let skipped = 0;
-  const createdInvoices = [];
+  const createdIds = [];
 
   for (const student of students) {
-    // Skip if invoice already exists for this student + term
-    const existing = await feesRepository.findInvoiceByStudentAndTerm(schoolId, student.id, term_id);
+    const existing = await repo.findInvoiceByStudentAndTerm(schoolId, student.id, term_id);
     if (existing) { skipped++; continue; }
 
     const invoice = await db.schoolTransaction(schoolId, async (client) => {
       const { rows: [newInvoice] } = await client.query(
         `INSERT INTO invoices (student_id, term_id, total_amount, status, school_id)
-         VALUES ($1,$2,$3,'UNPAID',$4) RETURNING *`,
-        [student.id, term_id, total_amount, schoolId]
+         VALUES ($1, $2, $3, 'UNPAID', $4)
+         RETURNING *`,
+        [student.id, term_id, totalAmount, schoolId],
       );
 
-      const placeholders = feeItems.map((_, i) => `($${i*4+1},$${i*4+2},$${i*4+3},$${i*4+4})`).join(', ');
-      const itemParams   = feeItems.flatMap(({ description, amount }) => [
+      const placeholders = feeItems.map((_, i) =>
+        `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`,
+      ).join(', ');
+
+      const itemParams = feeItems.flatMap(({ description, amount }) => [
         newInvoice.id, description, parseFloat(amount), schoolId,
       ]);
+
       await client.query(
-        `INSERT INTO invoice_items (invoice_id, description, amount, school_id) VALUES ${placeholders}`,
-        itemParams
+        `INSERT INTO invoice_items (invoice_id, description, amount, school_id)
+         VALUES ${placeholders}`,
+        itemParams,
       );
 
       return newInvoice;
     });
 
-    createdInvoices.push(invoice.id);
+    createdIds.push(invoice.id);
     created++;
   }
 
@@ -133,92 +151,137 @@ const generateInvoice = async (data, schoolId) => {
       total_students: students.length,
       created,
       skipped,
-      total_amount: total_amount.toFixed(2),
+      total_amount: totalAmount.toFixed(2),
     },
-    invoice_ids: createdInvoices,
+    invoice_ids: createdIds,
   };
 };
 
+/**
+ * Paginated invoice list with optional filters.
+ */
 const getInvoices = async (schoolId, filters) => {
   const { student_id, term_id, status, page = 1, limit = 20 } = filters;
   const offset = (page - 1) * limit;
 
   const [invoices, totalCount] = await Promise.all([
-    feesRepository.findInvoicesWithFilters(schoolId, { student_id, term_id, status, limit, offset }),
-    feesRepository.countInvoices(schoolId, { student_id, term_id, status }),
+    repo.findInvoicesWithFilters(schoolId, { student_id, term_id, status, limit, offset }),
+    repo.countInvoices(schoolId,           { student_id, term_id, status }),
   ]);
 
   return {
     invoices,
     pagination: {
-      page, limit, totalCount,
+      page:       Number(page),
+      limit:      Number(limit),
+      totalCount,
       totalPages: Math.ceil(totalCount / limit),
-      hasNext: page * limit < totalCount,
-      hasPrev: page > 1,
+      hasNext:    page * limit < totalCount,
+      hasPrev:    page > 1,
     },
   };
 };
 
-const getInvoiceById = async (schoolId, invoiceId) =>
-  feesRepository.findInvoiceByIdWithItems(schoolId, invoiceId);
+const getInvoiceById = (schoolId, invoiceId) =>
+  repo.findInvoiceByIdWithItems(schoolId, invoiceId);
 
-const getStudentInvoices = async (schoolId, studentId) =>
-  feesRepository.findInvoicesByStudent(schoolId, studentId);
+const getStudentInvoices = (schoolId, studentId) =>
+  repo.findInvoicesByStudent(schoolId, studentId);
 
+// ─── Payments ─────────────────────────────────────────────────────────────────
+
+/**
+ * Record a payment against an invoice.
+ * Validates that the payment does not exceed the remaining balance.
+ */
 const recordPayment = async (paymentData, schoolId) => {
-  const { invoice_id, amount, payment_method, reference_number, payment_date, received_by } = paymentData;
+  const {
+    invoice_id, amount, payment_method,
+    reference_number, payment_date, received_by,
+  } = paymentData;
 
-  const invoice = await feesRepository.findInvoiceById(schoolId, invoice_id);
+  const invoice = await repo.findInvoiceById(schoolId, invoice_id);
   if (!invoice) throw new Error('Invoice not found');
 
-  const paidSoFar = await feesRepository.getTotalPaidAmount(schoolId, invoice_id);
+  if (invoice.status === 'PAID') {
+    throw new Error('Invoice is already fully paid');
+  }
+
+  const paidSoFar = await repo.getTotalPaidAmount(schoolId, invoice_id);
   const remaining = parseFloat(invoice.total_amount) - paidSoFar;
 
-  if (parseFloat(amount) > remaining)
-    throw new Error(`Payment amount exceeds remaining balance of ${remaining.toFixed(2)}`);
+  if (parseFloat(amount) <= 0) {
+    throw new Error('Payment amount must be greater than zero');
+  }
+  if (parseFloat(amount) > remaining) {
+    throw new Error(
+      `Payment amount exceeds remaining balance of ${remaining.toFixed(2)}`,
+    );
+  }
 
-  const payment = await feesRepository.createPayment(schoolId,
-    { invoice_id, amount, payment_method, reference_number, payment_date, received_by }
-  );
+  const payment = await repo.createPayment(schoolId, {
+    invoice_id, amount, payment_method,
+    reference_number, payment_date, received_by,
+  });
 
-  return feesRepository.findPaymentById(schoolId, payment.id);
+  return repo.findPaymentById(schoolId, payment.id);
 };
 
+/**
+ * Paginated payment list with optional filters.
+ */
 const getPayments = async (schoolId, filters) => {
-  const { invoice_id, payment_method, start_date, end_date, page = 1, limit = 20 } = filters;
+  const {
+    invoice_id, payment_method, start_date, end_date,
+    page = 1, limit = 20,
+  } = filters;
   const offset = (page - 1) * limit;
 
   const [payments, totalCount] = await Promise.all([
-    feesRepository.findPaymentsWithFilters(schoolId, { invoice_id, payment_method, start_date, end_date, limit, offset }),
-    feesRepository.countPayments(schoolId, { invoice_id, payment_method, start_date, end_date }),
+    repo.findPaymentsWithFilters(schoolId, {
+      invoice_id, payment_method, start_date, end_date, limit, offset,
+    }),
+    repo.countPayments(schoolId, {
+      invoice_id, payment_method, start_date, end_date,
+    }),
   ]);
 
   return {
     payments,
     pagination: {
-      page, limit, totalCount,
+      page:       Number(page),
+      limit:      Number(limit),
+      totalCount,
       totalPages: Math.ceil(totalCount / limit),
-      hasNext: page * limit < totalCount,
-      hasPrev: page > 1,
+      hasNext:    page * limit < totalCount,
+      hasPrev:    page > 1,
     },
   };
 };
 
-const getPaymentById = async (schoolId, paymentId) =>
-  feesRepository.findPaymentById(schoolId, paymentId);
+const getPaymentById = (schoolId, paymentId) =>
+  repo.findPaymentById(schoolId, paymentId);
+
+// ─── Student balance ──────────────────────────────────────────────────────────
 
 const getStudentBalance = async (schoolId, studentId) => {
-  const student = await db.schoolQueryOne(schoolId,
-    `SELECT id, admission_no, first_name, last_name FROM students WHERE id = $1`, [studentId]
+  const student = await db.schoolQueryOne(
+    schoolId,
+    'SELECT id, admission_no, first_name, last_name FROM students WHERE id = $1',
+    [studentId],
   );
   if (!student) return null;
 
-  const invoices    = await feesRepository.getStudentBalanceSummary(schoolId, studentId);
+  const invoices    = await repo.getStudentBalanceSummary(schoolId, studentId);
   const totalBilled = invoices.reduce((sum, inv) => sum + parseFloat(inv.total_amount),     0);
   const totalPaid   = invoices.reduce((sum, inv) => sum + parseFloat(inv.paid_amount || 0), 0);
 
   return {
-    student: { id: student.id, admission_no: student.admission_no, name: `${student.first_name} ${student.last_name}` },
+    student: {
+      id:           student.id,
+      admission_no: student.admission_no,
+      name:         `${student.first_name} ${student.last_name}`,
+    },
     summary: {
       total_billed:  totalBilled.toFixed(2),
       total_paid:    totalPaid.toFixed(2),
@@ -228,21 +291,42 @@ const getStudentBalance = async (schoolId, studentId) => {
   };
 };
 
-const getFeeStructures = async (schoolId, filters) =>
-  feesRepository.findFeeStructures(schoolId, filters);
+// ─── Fee structures ───────────────────────────────────────────────────────────
 
-const createFeeStructure = async (data, schoolId) =>
-  feesRepository.createFeeStructure(schoolId, data);
+const getFeeStructures  = (schoolId, filters) => repo.findFeeStructures(schoolId, filters);
+const createFeeStructure = (data, schoolId)   => repo.createFeeStructure(schoolId, data);
 
-const getFeeCollectionSummary = async (schoolId, filters) =>
-  feesRepository.getFeeCollectionSummary(schoolId, filters);
+// ─── Reports ─────────────────────────────────────────────────────────────────
 
-const getFeeDefaulters = async (schoolId, filters) =>
-  feesRepository.getFeeDefaulters(schoolId, filters);
+const getFeeCollectionSummary = (schoolId, filters) =>
+  repo.getFeeCollectionSummary(schoolId, filters);
+
+const getFeeDefaulters = (schoolId, filters) =>
+  repo.getFeeDefaulters(schoolId, filters);
+
+// ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
-  createInvoice, generateInvoice, getInvoices, getInvoiceById, getStudentInvoices,
-  recordPayment, getPayments, getPaymentById,
-  getStudentBalance, getFeeStructures, createFeeStructure,
-  getFeeCollectionSummary, getFeeDefaulters,
+  // Invoices
+  createInvoice,
+  generateInvoices,   // renamed from generateInvoice — plural is accurate
+  getInvoices,
+  getInvoiceById,
+  getStudentInvoices,
+
+  // Payments
+  recordPayment,
+  getPayments,
+  getPaymentById,
+
+  // Balance
+  getStudentBalance,
+
+  // Fee structures
+  getFeeStructures,
+  createFeeStructure,
+
+  // Reports
+  getFeeCollectionSummary,
+  getFeeDefaulters,
 };

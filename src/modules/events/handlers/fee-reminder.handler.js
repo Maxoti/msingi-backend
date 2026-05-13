@@ -191,7 +191,7 @@ const handleUpcomingDueReminder = async (data = {}) => {
     const results = await Promise.allSettled(reminders);
     const successful = results.filter(r => r.status === 'fulfilled' && r.value).length;
     
-    console.log(`✅ Upcoming due reminders: ${successful}/${reminders.length} sent`);
+    console.log(` Upcoming due reminders: ${successful}/${reminders.length} sent`);
 
     return {
       success: true,
@@ -200,7 +200,7 @@ const handleUpcomingDueReminder = async (data = {}) => {
     };
 
   } catch (error) {
-    console.error('❌ [EVENT] Error handling upcoming due reminder:', error);
+    console.error(' [EVENT] Error handling upcoming due reminder:', error);
     throw error;
   }
 };

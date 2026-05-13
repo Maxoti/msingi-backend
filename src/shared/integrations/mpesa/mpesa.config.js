@@ -1,34 +1,41 @@
 /**
- * M-Pesa Configuration
- * Loads M-Pesa settings from environment variables
+ * M-Pesa Configuration — Lipana (lipana.dev)
+ * Replaces: src/shared/integrations/mpesa/mpesa.config.js
+ *
+ * Previously used Safaricom Daraja (consumerKey, shortCode, passkey).
+ * Lipana abstracts all of that — you only need your secret key + callback URL.
  */
 
-const getMpesaConfig = () => {
-  const environment = process.env.MPESA_ENVIRONMENT || 'sandbox';
-  
-  // Base URLs for different environments
-  const baseURLs = {
-    sandbox: 'https://sandbox.safaricom.co.ke',
-    production: 'https://api.safaricom.co.ke'
-  };
+'use strict';
 
-  return {
-    environment,
-    baseURL: baseURLs[environment],
-    consumerKey: process.env.MPESA_CONSUMER_KEY,
-    consumerSecret: process.env.MPESA_CONSUMER_SECRET,
-    shortCode: process.env.MPESA_SHORTCODE,
-    passkey: process.env.MPESA_PASSKEY,
-    callbackURL: process.env.MPESA_CALLBACK_URL || `${process.env.API_BASE_URL}/api/v1/webhooks/mpesa/callback`,
-    
-    // Validation
-    isConfigured: !!(
-      process.env.MPESA_CONSUMER_KEY &&
-      process.env.MPESA_CONSUMER_SECRET &&
-      process.env.MPESA_SHORTCODE &&
-      process.env.MPESA_PASSKEY
-    )
-  };
+const config = {
+  // ── Lipana API base URL ──────────────────────────────────────────────────
+  baseURL: 'https://api.lipana.dev',
+
+  // ── Your secret key from lipana.dev/dashboard → API Keys ────────────────
+  // lip_sk_live_...  (NEVER expose this on the frontend)
+  secretKey: process.env.LIPANA_SECRET_KEY,
+
+  // ── Webhook URL: Lipana POSTs here after every payment ──────────────────
+  // Must be a publicly reachable HTTPS URL.
+  // Local dev: use ngrok → npx ngrok http 3000
+  callbackURL: `${process.env.APP_URL}/api/v1/webhooks/mpesa/callback`,
+
+  // ── Optional: your publishable key (safe for frontend use) ───────────────
+  publishableKey: process.env.LIPANA_PUBLISHABLE_KEY,
 };
 
-module.exports = getMpesaConfig;
+// ── Validate at startup ──────────────────────────────────────────────────────
+if (!config.secretKey) {
+  console.warn(
+    '  [MPESA] LIPANA_SECRET_KEY is not set. M-Pesa payments will fail.'
+  );
+}
+
+if (!process.env.APP_URL) {
+  console.warn(
+    '  [MPESA] APP_URL is not set. Lipana cannot reach your webhook.'
+  );
+}
+
+module.exports = config;

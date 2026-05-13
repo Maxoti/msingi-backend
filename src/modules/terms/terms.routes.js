@@ -1,103 +1,76 @@
 /**
- * Terms Routes
- * API routes for academic terms management
+ * Academic Terms Routes
+ *
+ * Mount point: /api/v1/terms
+ * Auth:        All routes require a valid JWT (router-level middleware)
+ * Multi-tenancy: req.schoolId is injected by authenticate()
+ *
+ * Route ordering rules (Express matches top-to-bottom):
+ *   1. Static segments before parameterised ones  (/active before /:id)
+ *   2. More-specific paths before less-specific   (/:id/statistics before /:id)
+ *   3. Write operations use semantically correct HTTP verbs
+ *      POST   → create a new resource
+ *      PATCH  → partial update of an existing resource
+ *      DELETE → remove a resource
+ *      (PUT is intentionally absent — full-replacement semantics don't apply here)
  */
 
-const express = require('express');
-const router = express.Router();
-const termsController = require('./terms.controller');
+'use strict';
+
+const { Router } = require('express');
 const { authenticate, authorize } = require('../../shared/middleware/auth');
+const ctrl = require('./terms.controller');
 
-console.log('[ROUTES] Terms routes module loaded');
+const router = Router();
 
-// All routes require authentication
+// ── Auth guard (applies to every route below) ─────────────────────────────────
 router.use(authenticate);
 
-/* -------------------------------------------------------------------------- */
-/*                    ADMIN & TEACHER ROUTES (VIEW ACCESS)                    */
-/* -------------------------------------------------------------------------- */
+// ── Shorthand role sets ───────────────────────────────────────────────────────
+const adminOnly      = authorize('ADMIN');
+const adminOrTeacher = authorize('ADMIN', 'TEACHER');
 
-/**
- * @route   GET /api/v1/terms
- * @desc    Get all academic terms with pagination
- * @access  Admin, Teacher
- */
-router.get('/', authorize('ADMIN', 'TEACHER'), termsController.getAllTerms);
+// ═══════════════════════════════════════════════════════════════════════════════
+// READ  (GET)  —  Admin + Teacher
+// Static/specific routes MUST come before /:id to avoid being swallowed by it
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * @route   GET /api/v1/terms/active
- * @desc    Get currently active term
- * @access  Admin, Teacher
- */
-router.get('/active', authorize('ADMIN', 'TEACHER'), termsController.getActiveTerm);
+// GET /api/v1/terms
+router.get('/',                adminOrTeacher, ctrl.getAllTerms);
 
-/**
- * @route   GET /api/v1/terms/current
- * @desc    Get term for specific date (defaults to today)
- * @access  Admin, Teacher
- */
-router.get('/current', authorize('ADMIN', 'TEACHER'), termsController.getCurrentTerm);
+// GET /api/v1/terms/active
+router.get('/active',          adminOrTeacher, ctrl.getActiveTerm);
 
-/**
- * @route   GET /api/v1/terms/years
- * @desc    Get all years that have terms
- * @access  Admin, Teacher
- */
-router.get('/years', authorize('ADMIN', 'TEACHER'), termsController.getAllYears);
+// GET /api/v1/terms/current?date=YYYY-MM-DD
+router.get('/current',         adminOrTeacher, ctrl.getCurrentTerm);
 
-/**
- * @route   GET /api/v1/terms/year/:year
- * @desc    Get all terms for a specific year
- * @access  Admin, Teacher
- */
-router.get('/year/:year', authorize('ADMIN', 'TEACHER'), termsController.getTermsByYear);
+// GET /api/v1/terms/years
+router.get('/years',           adminOrTeacher, ctrl.getAllYears);
 
-/**
- * @route   GET /api/v1/terms/:id
- * @desc    Get term by ID
- * @access  Admin, Teacher
- */
-router.get('/:id', authorize('ADMIN', 'TEACHER'), termsController.getTermById);
+// GET /api/v1/terms/year/2026
+router.get('/year/:year',      adminOrTeacher, ctrl.getTermsByYear);
 
-/**
- * @route   GET /api/v1/terms/:id/statistics
- * @desc    Get term statistics (exams, students, etc.)
- * @access  Admin, Teacher
- */
-router.get('/:id/statistics', authorize('ADMIN', 'TEACHER'), termsController.getTermStatistics);
+// GET /api/v1/terms/42/statistics   ← must be before /:id
+router.get('/:id/statistics',  adminOrTeacher, ctrl.getTermStatistics);
 
-/* -------------------------------------------------------------------------- */
-/*                        ADMIN-ONLY ROUTES (MODIFICATIONS)                   */
-/* -------------------------------------------------------------------------- */
+// GET /api/v1/terms/42
+router.get('/:id',             adminOrTeacher, ctrl.getTermById);
 
-/**
- * @route   POST /api/v1/terms
- * @desc    Create a new academic term
- * @access  Admin only
- */
-router.post('/', authorize('ADMIN'), termsController.createTerm);
+// ═══════════════════════════════════════════════════════════════════════════════
+// WRITE  —  Admin only
+// Specific sub-routes (/:id/activate) before the bare /:id handlers
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * @route   PUT /api/v1/terms/:id
- * @desc    Update an academic term
- * @access  Admin only
- */
-router.put('/:id', authorize('ADMIN'), termsController.updateTerm);
+// POST   /api/v1/terms
+router.post('/',               adminOnly, ctrl.createTerm);
 
-/**
- * @route   POST /api/v1/terms/:id/activate
- * @desc    Activate a term (deactivates others)
- * @access  Admin only
- */
-router.post('/:id/activate', authorize('ADMIN'), termsController.setActiveTerm);
+// PATCH  /api/v1/terms/42/activate   ← must be before PATCH /:id
+router.patch('/:id/activate',  adminOnly, ctrl.setActiveTerm);
 
-/**
- * @route   DELETE /api/v1/terms/:id
- * @desc    Delete an academic term
- * @access  Admin only
- */
-router.delete('/:id', authorize('ADMIN'), termsController.deleteTerm);
+// PATCH  /api/v1/terms/42
+router.patch('/:id',           adminOnly, ctrl.updateTerm);
 
-console.log('[ROUTES] Total terms routes registered:', router.stack.length);
+// DELETE /api/v1/terms/42
+router.delete('/:id',          adminOnly, ctrl.deleteTerm);
 
 module.exports = router;

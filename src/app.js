@@ -29,6 +29,7 @@ const PUBLIC_PATHS = [
   '/api/v1/auth/reset-password',
   '/api/v1/webhooks',
   '/api/v1/health',
+  '/api/v1/schools/onboard'
 ];
 
 app.use('/api/v1', (req, res, next) => {
@@ -40,7 +41,6 @@ app.use('/api/v1', (req, res, next) => {
 
 app.use('/api/v1', noCache);
 
-// â”€â”€ Health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.get('/health', async (req, res) => {
   const db = require('./shared/database/client');
   let dbStatus  = 'disconnected';
@@ -61,7 +61,6 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// â”€â”€ Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const load = (path, mountPath, label) => {
   try {
     app.use(mountPath, require(path));
@@ -105,7 +104,6 @@ load('./modules/schools/schools.routes',       '/api/v1/schools',       'Schools
 load('./modules/timetable/timetable.routes',  '/api/v1/timetable',     'Timetable');
 load('./modules/artificial_Intelligence/ai.routes', '/api/v1/ai', 'AI');
 
-// â”€â”€ Error handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.use(notFound);
 app.use(errorHandler);
 

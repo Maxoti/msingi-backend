@@ -434,7 +434,7 @@ const bulkImportStudents = async (studentsData, schoolId) => {
   try {
     const imported = await studentsRepository.bulkCreate(validStudents, schoolId);
 
-    // ✅ Invalidate cache after bulk import
+    //  Invalidate cache after bulk import
     await cache.delPattern(`students:${schoolId}:*`);
 
     eventBus.emit('student.bulkImported', { school_id: schoolId, count: imported.length });
@@ -465,7 +465,7 @@ const promoteStudents = async (schoolId, student_ids, new_class_id) => {
     }
   }
 
-  // ✅ Invalidate cache after bulk promote
+  //  Invalidate cache after bulk promote
   await cache.delPattern(`students:${schoolId}:*`);
 
   return results;
@@ -494,7 +494,7 @@ const deactivateStudent = async (schoolId, id, reason) => {
     status: statusMap[reason] || 'COMPLETED'
   });
 
-  // ✅ Invalidate cache
+  //  Invalidate cache
   await cache.delPattern(`students:${schoolId}:*`);
 
   eventBus.emit('student.deactivated', { studentId: student.id, school_id: student.schoolId, reason });
@@ -507,7 +507,7 @@ const reactivateStudent = async (schoolId, id) => {
 
   const result = await studentsRepository.update(schoolId, id, { is_active: true, status: 'ACTIVE' });
 
-  // ✅ Invalidate cache
+  //  Invalidate cache
   await cache.delPattern(`students:${schoolId}:*`);
 
   eventBus.emit('student.reactivated', { studentId: student.id, school_id: student.schoolId });

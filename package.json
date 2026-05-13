@@ -36,6 +36,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@lipana/sdk": "^1.0.3",
     "axios": "^1.13.4",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
@@ -48,6 +49,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
+    "ngrok": "^5.0.0-beta.2",
     "nock": "^14.0.10",
     "node-cron": "^4.2.1",
     "pg": "^8.16.3",
