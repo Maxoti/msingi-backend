@@ -58,6 +58,21 @@ const startServer = async () => {
   // Try to connect to database (with retries)
   await retryDatabaseConnection(3, 3000); // 3 attempts, 3 seconds apart
 
+  // Keep-alive ping to prevent Render free tier from sleeping
+  const keepAlive = () => {
+    const url = process.env.RENDER_URL;
+    if (url) {
+      const https = require('https');
+      https.get(url, (res) => {
+        console.log(`Keep-alive ping: ${res.statusCode}`);
+      }).on('error', (err) => {
+        console.error(`Keep-alive error: ${err.message}`);
+      });
+    }
+  };
+  setInterval(keepAlive, 14 * 60 * 1000);
+
+
   // Start Express server regardless of DB status
   const server = app.listen(PORT, () => {
     console.log('');
@@ -134,7 +149,7 @@ const startServer = async () => {
         console.log(' Database pool closed');
         process.exit(0);
       } catch (error) {
-        console.error('❌ Error during shutdown:', error);
+        console.error(' Error during shutdown:', error);
         process.exit(1);
       }
     });
