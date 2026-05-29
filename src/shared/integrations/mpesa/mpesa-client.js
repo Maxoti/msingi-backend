@@ -6,6 +6,8 @@
 'use strict';
 
 const { Lipana } = require('@lipana/sdk');
+const axios = require('axios');
+
 
 const client = new Lipana({
   apiKey: process.env.LIPANA_SECRET_KEY,
@@ -37,6 +39,24 @@ class LipanaClient {
       throw new Error(error?.response?.data?.message || error?.message || 'STK Push failed');
     }
   }
+
+
+
+// ─── GET TRANSACTION (fetch real M-PESA receipt) ──────────────────────────
+async getTransaction(transactionId) {
+  try {
+    const response = await client.transactions.retrieve(transactionId);
+    console.log('[LIPANA] getTransaction response:', JSON.stringify(response, null, 2));
+    return response;
+  } catch (error) {
+    console.error('[LIPANA] getTransaction error:',
+      error?.response?.status,
+      JSON.stringify(error?.response?.data || error.message)
+    );
+    return null;
+  }
+}
+
 
   // ─── QUERY STATUS ─────────────────────────────────────────────────────────
   // Lipana uses webhooks for payment confirmation — polling is not supported.
