@@ -11,7 +11,7 @@ const askAI = async (prompt) => {
       },
       {
         headers: {
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+          'Authorization': `Bearer ${process.env.Groq_API_KEY}`,
           'Content-Type': 'application/json'
         }
       }
