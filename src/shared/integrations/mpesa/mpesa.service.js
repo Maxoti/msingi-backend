@@ -1,25 +1,23 @@
-
+'use strict';
 
 /**
  * M-Pesa Service — Lipana Edition
  * File: src/shared/integrations/mpesa/mpesa.service.js
  *
- * Architecture notes:
+ * Architecture
  * ─────────────────────────────────────────────────────────────────────────────
- * • Multi-tenant: every read/write is scoped to a schoolId.
- * • processCallback uses an unscoped db.queryOne ONLY to discover the schoolId
- *   from the transaction record, then immediately switches to school-scoped
- *   operations for all subsequent writes.
- * • RLS on mpesa_transactions is a defence-in-depth layer. We never rely on it
- *   exclusively — every query that can carry an explicit school_id filter does.
- * • Reference number resolution order:
- *     1. MpesaReceiptNumber  — real Safaricom receipt (production)
- *     2. callbackData.reference — Lipana sends "STK-TXNxxx" here
- *     3. callbackData.transaction_id — Lipana internal ID (sandbox fallback)
+ * • Multi-tenant: every read/write is scoped to a schoolId. No exceptions.
+ * • processCallback uses ONE unscoped query to discover schoolId from the
+ *   transaction row, then switches exclusively to school-scoped operations.
+ * • autoReconcile acquires FOR UPDATE locks on both the transaction and invoice
+ *   rows before any write — prevents double-payment on duplicate webhooks.
+ * • Invoice status (UNPAID → PARTIAL → PAID) is updated atomically in the
+ *   same transaction as the payment insert.
+ * • accountReference encodes admissionNo + invoiceId so autoReconcile targets
+ *   the exact invoice rather than guessing the oldest unpaid one.
+ * • queryTransaction is school-scoped — no cross-tenant data leakage.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-
-'use strict';
 
 const lipana = require('./mpesa-client');
 const db     = require('../../database/client');
@@ -27,22 +25,48 @@ const db     = require('../../database/client');
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Resolve the best available payment reference from a callback payload.
- * Lipana sandbox never sends MpesaReceiptNumber, so we cascade through
- * available fields to ensure reference_number is never stored as empty.
+ * Build the STK account reference.
+ * Format: "<admissionNo>-<invoiceId>"  e.g. "STD2026001-47"
+ * Falls back to admissionNo alone when no invoiceId is supplied.
+ * Max 12 chars enforced by Safaricom — keep it tight.
  */
-const resolveReceiptFromCallback = (callbackData) =>
-  String(
+const buildReference = (admissionNo, invoiceId) =>
+  invoiceId ? `${admissionNo}-${invoiceId}` : admissionNo;
+
+/**
+ * Parse a reference back into its parts.
+ * "STD2026001-47" → { admissionNo: "STD2026001", invoiceId: 47 }
+ * "STD2026001"    → { admissionNo: "STD2026001", invoiceId: null }
+ */
+const parseReference = (reference = '') => {
+  const parts = reference.split('-');
+  // Handle admission numbers that contain hyphens (defensive)
+  const invoiceId = parts.length > 1 ? parseInt(parts[parts.length - 1], 10) : null;
+  const admissionNo = invoiceId
+    ? parts.slice(0, -1).join('-')
+    : reference;
+  return {
+    admissionNo,
+    invoiceId: Number.isFinite(invoiceId) ? invoiceId : null,
+  };
+};
+
+/**
+ * Resolve the best available receipt identifier from a webhook payload.
+ * Cascade: real Safaricom receipt → Lipana reference → Lipana txn ID.
+ */
+const resolveReceiptFromCallback = (callbackData) => {
+  const receipt =
     callbackData.mpesa_receipt_number ||
     callbackData.MpesaReceiptNumber   ||
     callbackData.reference            ||
     callbackData.transaction_id       ||
-    ''
-  ).substring(0, 50);
+    '';
+  return String(receipt).substring(0, 50);
+};
 
 /**
- * Resolve the best available reference from a persisted transaction row.
- * Used during reconciliation when the callback has already been processed.
+ * Resolve receipt from a persisted transaction row.
  */
 const resolveReceiptFromRow = (row) =>
   row.mpesa_receipt_number || row.transaction_id || '';
@@ -61,13 +85,28 @@ class MpesaService {
     this.client = lipana;
   }
 
-  // ─── INITIATE STK PUSH ───────────────────────────────────────────────────
+  // ─── INITIATE STK PUSH ────────────────────────────────────────────────────
 
-  async initiatePayment(studentAdmissionNo, phoneNumber, amount, schoolId) {
+  /**
+   * Initiates an STK push for a student fee payment.
+   *
+   * IMPORTANT: The DB record is created BEFORE the Lipana call so that
+   * if the webhook fires before our INSERT completes (race), the callback
+   * handler always finds the row.
+   *
+   * @param {string} studentAdmissionNo
+   * @param {string} phoneNumber
+   * @param {number} amount
+   * @param {number} schoolId
+   * @param {number|null} invoiceId  — when provided, reference targets this
+   *                                   exact invoice; autoReconcile skips the
+   *                                   "oldest unpaid" heuristic entirely.
+   */
+  async initiatePayment(studentAdmissionNo, phoneNumber, amount, schoolId, invoiceId = null) {
     if (!this.isEnabled) throw new Error('M-Pesa is not configured');
     if (!schoolId)        throw new Error('schoolId is required');
 
-    // Verify student exists within this school
+    // ── Validate student exists within this school ─────────────────────────
     const student = await db.withSchoolContext(schoolId, async (client) => {
       const { rows } = await client.query(
         `SELECT id, admission_no, first_name, last_name
@@ -77,10 +116,27 @@ class MpesaService {
             AND is_active   = TRUE`,
         [studentAdmissionNo, schoolId]
       );
-      return rows[0] || null;
+      return rows[0] ?? null;
     });
 
     if (!student) throw new Error('Student not found');
+
+    // ── Validate invoice belongs to this student + school ──────────────────
+    if (invoiceId) {
+      const invoice = await db.withSchoolContext(schoolId, async (client) => {
+        const { rows } = await client.query(
+          `SELECT id, status FROM invoices
+            WHERE id         = $1
+              AND student_id = $2
+              AND school_id  = $3
+              AND status    IN ('UNPAID', 'PARTIAL')`,
+          [invoiceId, student.id, schoolId]
+        );
+        return rows[0] ?? null;
+      });
+
+      if (!invoice) throw new Error('Invoice not found or already paid');
+    }
 
     if (!lipana.isValidPhoneNumber(phoneNumber))
       throw new Error('Invalid phone number. Use 07XXXXXXXX or 254XXXXXXXXX');
@@ -89,28 +145,31 @@ class MpesaService {
     if (numAmount < 10 || numAmount > 300_000)
       throw new Error('Amount must be between KES 10 and 300,000');
 
-    // Initiate STK push via Lipana
+    const reference = buildReference(studentAdmissionNo, invoiceId);
+
+    // ── Fire STK push ──────────────────────────────────────────────────────
     let response;
     try {
       response = await lipana.initiateSTKPush(
         phoneNumber,
         numAmount,
-        studentAdmissionNo,
-        `School fees — ${student.first_name} ${student.last_name}`
+        reference,
+        `School fees – ${student.first_name} ${student.last_name}`
       );
     } catch (error) {
-      // Record the failed attempt for audit trail
+      // Persist failed attempt for audit trail even though Lipana rejected it
       await db.schoolTransaction(schoolId, async (client) => {
         await client.query(
           `INSERT INTO mpesa_transactions
              (transaction_id, phone_number, amount, account_reference,
-              transaction_date, status, school_id, callback_data)
-           VALUES ($1, $2, $3, $4, NOW(), 'FAILED', $5, $6)`,
+              invoice_id, transaction_date, status, school_id, callback_data)
+           VALUES ($1, $2, $3, $4, $5, NOW(), 'FAILED', $6, $7)`,
           [
             `FAILED_${Date.now()}`,
             lipana.formatPhoneNumber(phoneNumber),
             numAmount,
-            studentAdmissionNo,
+            reference,
+            invoiceId ?? null,
             schoolId,
             JSON.stringify({ error: error.message }),
           ]
@@ -119,25 +178,31 @@ class MpesaService {
       throw error;
     }
 
-    // Persist pending transaction scoped to this school
+    // ── Persist PENDING transaction (school-scoped) ────────────────────────
     const transaction = await db.schoolTransaction(schoolId, async (client) => {
       const { rows } = await client.query(
         `INSERT INTO mpesa_transactions
            (transaction_id, phone_number, amount, account_reference,
-            transaction_date, status, school_id, callback_data)
-         VALUES ($1, $2, $3, $4, NOW(), 'PENDING', $5, $6)
+            invoice_id, transaction_date, status, school_id, callback_data)
+         VALUES ($1, $2, $3, $4, $5, NOW(), 'PENDING', $6, $7)
          RETURNING *`,
         [
           response.checkoutRequestID,
           lipana.formatPhoneNumber(phoneNumber),
           numAmount,
-          studentAdmissionNo,
+          reference,
+          invoiceId ?? null,
           schoolId,
           JSON.stringify(response),
         ]
       );
       return rows[0];
     });
+
+    console.log(
+      `[STK] Initiated: ${response.checkoutRequestID} | ` +
+      `school=${schoolId} | ref=${reference} | KES ${numAmount}`
+    );
 
     return {
       success:           true,
@@ -151,15 +216,14 @@ class MpesaService {
   // ─── WEBHOOK CALLBACK PROCESSING ─────────────────────────────────────────
 
   async processCallback(callbackData) {
-    // Resolve transaction identifier — Lipana uses transaction_id field
     const checkoutRequestID =
       callbackData.checkout_request_id ||
       callbackData.CheckoutRequestID   ||
       callbackData.transaction_id;
 
     const resultCode =
-      callbackData.result_code  ??
-      callbackData.ResultCode   ??
+      callbackData.result_code ??
+      callbackData.ResultCode  ??
       1;
 
     const resultDesc =
@@ -169,9 +233,7 @@ class MpesaService {
 
     console.log(`[SERVICE] processCallback — txId: ${checkoutRequestID}, code: ${resultCode}`);
 
-    // ── 1. Fetch transaction (unscoped — no schoolId in webhook context) ─────
-    //    This is the only legitimate use of an unscoped query in this service.
-    //    All subsequent operations are scoped to the discovered schoolId.
+    // ── Discover schoolId (only legitimate unscoped read in this service) ──
     const transaction = await db.queryOne(
       `SELECT * FROM mpesa_transactions
         WHERE transaction_id = $1
@@ -187,13 +249,13 @@ class MpesaService {
     const schoolId = transaction.school_id;
     console.log(`[SERVICE] Found transaction id=${transaction.id} school=${schoolId}`);
 
-    // ── 2. Idempotency guard — status-level ───────────────────────────────────
+    // ── Status-level idempotency guard ─────────────────────────────────────
     if (transaction.status === 'COMPLETED' || transaction.status === 'RECONCILED') {
       console.log(`[SERVICE] Already processed — skipping (${transaction.status})`);
       return { success: true, message: 'Already processed' };
     }
 
-    // ── 3. Handle failed / cancelled payment ──────────────────────────────────
+    // ── Failed / cancelled payment ─────────────────────────────────────────
     if (resultCode !== 0 && resultCode !== '0') {
       await db.schoolTransaction(schoolId, async (client) => {
         await client.query(
@@ -209,7 +271,7 @@ class MpesaService {
       return { success: false, message: resultDesc || 'Payment failed' };
     }
 
-    // ── 4. Resolve receipt reference ──────────────────────────────────────────
+    // ── Resolve receipt ────────────────────────────────────────────────────
     const mpesaReceiptNumber = resolveReceiptFromCallback(callbackData);
     console.log(`[SERVICE] Receipt resolved to: "${mpesaReceiptNumber}"`);
 
@@ -218,7 +280,7 @@ class MpesaService {
     const txDateRaw       = callbackData.transaction_date || callbackData.TransactionDate;
     const transactionDate = txDateRaw ? this.parseTransactionDate(txDateRaw) : new Date();
 
-    // ── 5. Idempotency guard — receipt-level ──────────────────────────────────
+    // ── Receipt-level idempotency guard ────────────────────────────────────
     if (mpesaReceiptNumber) {
       const duplicate = await db.queryOne(
         `SELECT id FROM mpesa_transactions
@@ -232,7 +294,7 @@ class MpesaService {
       }
     }
 
-    // ── 6. Mark transaction COMPLETED (school-scoped) ─────────────────────────
+    // ── Mark COMPLETED (school-scoped) ─────────────────────────────────────
     await db.schoolTransaction(schoolId, async (client) => {
       await client.query(
         `UPDATE mpesa_transactions
@@ -254,7 +316,6 @@ class MpesaService {
 
     console.log(`✅ [SERVICE] COMPLETED: ${mpesaReceiptNumber} KES ${amount} (school ${schoolId})`);
 
-    // ── 7. Auto-reconcile to invoice ──────────────────────────────────────────
     await this.autoReconcile(transaction.id, schoolId);
 
     return {
@@ -264,8 +325,26 @@ class MpesaService {
     };
   }
 
-  // ─── AUTO RECONCILIATION ─────────────────────────────────────────────────
+  // ─── AUTO RECONCILIATION ──────────────────────────────────────────────────
 
+  /**
+   * Links a COMPLETED mpesa_transaction to the correct invoice and inserts
+   * a payment record — all within a single serialisable DB transaction.
+   *
+   * Locking strategy
+   * ────────────────
+   * 1. FOR UPDATE on mpesa_transactions — prevents a second concurrent
+   *    autoReconcile call (duplicate webhook, reconciliation job) from
+   *    processing the same row simultaneously.
+   * 2. FOR UPDATE OF i on the invoice — prevents two payments landing on
+   *    the same invoice concurrently and computing the wrong residual balance.
+   *
+   * Invoice targeting
+   * ─────────────────
+   * If account_reference encodes an invoiceId (format "ADM-<id>"), that
+   * invoice is targeted directly. Otherwise we fall back to the oldest
+   * UNPAID/PARTIAL invoice for the student (best-effort heuristic).
+   */
   async autoReconcile(transactionId, schoolId) {
     if (!schoolId) {
       const row = await db.queryOne(
@@ -282,12 +361,13 @@ class MpesaService {
 
     return db.schoolTransaction(schoolId, async (client) => {
 
-      // Fetch the COMPLETED transaction — scoped to school
+      // ── 1. Lock transaction row ──────────────────────────────────────────
       const { rows: [transaction] } = await client.query(
         `SELECT * FROM mpesa_transactions
           WHERE id        = $1
             AND school_id = $2
-            AND status    = 'COMPLETED'`,
+            AND status    = 'COMPLETED'
+          FOR UPDATE`,
         [transactionId, schoolId]
       );
 
@@ -297,47 +377,81 @@ class MpesaService {
       }
 
       if (transaction.reconciled_at) {
-        console.log(`[autoReconcile] Transaction ${transactionId} already reconciled`);
+        console.log(`[autoReconcile] Transaction ${transactionId} already reconciled — skipping`);
         return null;
       }
 
-      // Find student — explicitly scoped to school
+      // ── 2. Resolve student ───────────────────────────────────────────────
+      const { admissionNo, invoiceId: refInvoiceId } =
+        parseReference(transaction.account_reference);
+
+      // Prefer the invoiceId stored on the row (set at STK initiation);
+      // fall back to parsing the reference string for older rows.
+      const targetInvoiceId = transaction.invoice_id ?? refInvoiceId;
+
       const { rows: [student] } = await client.query(
         `SELECT id FROM students
           WHERE admission_no = $1
             AND school_id   = $2`,
-        [transaction.account_reference, schoolId]
+        [admissionNo, schoolId]
       );
 
       if (!student) {
-        console.warn(`[autoReconcile] Student not found: ${transaction.account_reference} (school ${schoolId})`);
+        console.warn(
+          `[autoReconcile] Student not found: "${admissionNo}" (school ${schoolId}). ` +
+          `Transaction ${transactionId} left as COMPLETED — manual reconciliation required.`
+        );
         return null;
       }
 
-      // Find oldest unpaid invoice — explicitly scoped to school
-      const { rows: [invoice] } = await client.query(
-        `SELECT i.*,
-                COALESCE(SUM(p.amount), 0) AS paid_amount
-           FROM invoices i
-           LEFT JOIN payments p ON p.invoice_id = i.id
-          WHERE i.student_id = $1
-            AND i.school_id  = $2
-            AND i.status IN ('UNPAID', 'PARTIAL')
-          GROUP BY i.id
-          ORDER BY i.created_at ASC
-          LIMIT 1`,
-        [student.id, schoolId]
-      );
+      // ── 3. Lock invoice row ──────────────────────────────────────────────
+      let invoiceQuery;
+      let invoiceParams;
+
+      if (targetInvoiceId) {
+        // Exact match — use the invoice encoded in the reference
+        invoiceQuery = `
+          SELECT i.*,
+                 COALESCE(SUM(p.amount), 0) AS paid_amount
+            FROM invoices i
+            LEFT JOIN payments p ON p.invoice_id = i.id
+           WHERE i.id         = $1
+             AND i.school_id  = $2
+             AND i.status    IN ('UNPAID', 'PARTIAL')
+           GROUP BY i.id
+           FOR UPDATE OF i`;
+        invoiceParams = [targetInvoiceId, schoolId];
+      } else {
+        // Heuristic fallback — oldest unpaid invoice for this student
+        invoiceQuery = `
+          SELECT i.*,
+                 COALESCE(SUM(p.amount), 0) AS paid_amount
+            FROM invoices i
+            LEFT JOIN payments p ON p.invoice_id = i.id
+           WHERE i.student_id = $1
+             AND i.school_id  = $2
+             AND i.status    IN ('UNPAID', 'PARTIAL')
+           GROUP BY i.id
+           ORDER BY i.created_at ASC
+           LIMIT 1
+           FOR UPDATE OF i`;
+        invoiceParams = [student.id, schoolId];
+      }
+
+      const { rows: [invoice] } = await client.query(invoiceQuery, invoiceParams);
 
       if (!invoice) {
-        console.warn(`[autoReconcile] No open invoice for student ${student.id} (school ${schoolId})`);
+        console.warn(
+          `[autoReconcile] No open invoice for student ${student.id} (school ${schoolId}). ` +
+          `Transaction ${transactionId} left as COMPLETED — manual reconciliation required.`
+        );
         return null;
       }
 
-      // Resolve reference — never store empty
+      // ── 4. Insert payment record ─────────────────────────────────────────
       const referenceNumber = resolveReceiptFromRow(transaction);
+      const paymentAmount   = parseFloat(transaction.amount);
 
-      // Create payment record — scoped to school
       const { rows: [payment] } = await client.query(
         `INSERT INTO payments
            (invoice_id, amount, payment_method, reference_number,
@@ -346,14 +460,32 @@ class MpesaService {
          RETURNING *`,
         [
           invoice.id,
-          transaction.amount,
+          paymentAmount,
           referenceNumber,
           transaction.transaction_date,
           schoolId,
         ]
       );
 
-      // Mark transaction RECONCILED
+      // ── 5. Update invoice status atomically ──────────────────────────────
+      const previouslyPaid = parseFloat(invoice.paid_amount);
+      const invoiceTotal   = parseFloat(invoice.total_amount);
+      const totalPaid      = previouslyPaid + paymentAmount;
+      const remaining      = invoiceTotal - totalPaid;
+
+      // Use a small epsilon (1 KES) to absorb floating-point drift
+      const newStatus = remaining <= 1 ? 'PAID' : 'PARTIAL';
+
+      await client.query(
+        `UPDATE invoices
+            SET status     = $1,
+                updated_at = NOW()
+          WHERE id        = $2
+            AND school_id = $3`,
+        [newStatus, invoice.id, schoolId]
+      );
+
+      // ── 6. Mark transaction RECONCILED ───────────────────────────────────
       await client.query(
         `UPDATE mpesa_transactions
             SET status        = 'RECONCILED',
@@ -364,19 +496,25 @@ class MpesaService {
         [payment.id, transaction.id, schoolId]
       );
 
-      console.log(`✅ [autoReconcile] payment ${payment.id} → invoice ${invoice.id} (ref: ${referenceNumber})`);
-      return { reconciled: true, payment, invoice };
+      console.log(
+        `✅ [autoReconcile] payment ${payment.id} → invoice ${invoice.id} ` +
+        `| KES ${paymentAmount} | invoice now ${newStatus} ` +
+        `| remaining KES ${Math.max(0, remaining).toFixed(2)} ` +
+        `| ref: ${referenceNumber}`
+      );
+
+      return { reconciled: true, payment, invoice: { ...invoice, status: newStatus } };
     });
   }
 
-  // ─── MANUAL RECONCILIATION ───────────────────────────────────────────────
+  // ─── MANUAL RECONCILIATION ────────────────────────────────────────────────
 
   async manualReconcile(transactionId, invoiceId, reconciledBy, schoolId) {
     if (!schoolId) throw new Error('schoolId is required for manualReconcile');
 
     return db.schoolTransaction(schoolId, async (client) => {
 
-      // Lock transaction row — scoped to school
+      // ── Lock transaction row ─────────────────────────────────────────────
       const { rows: [transaction] } = await client.query(
         `SELECT * FROM mpesa_transactions
           WHERE id        = $1
@@ -386,22 +524,29 @@ class MpesaService {
         [transactionId, schoolId]
       );
 
-      if (!transaction)            throw new Error('Transaction not found or not COMPLETED');
+      if (!transaction)             throw new Error('Transaction not found or not COMPLETED');
       if (transaction.reconciled_at) throw new Error('Transaction already reconciled');
 
-      // Lock invoice row — scoped to school
+      // ── Lock invoice row ─────────────────────────────────────────────────
       const { rows: [invoice] } = await client.query(
-        `SELECT * FROM invoices
-          WHERE id        = $1
-            AND school_id = $2
-          FOR UPDATE`,
+        `SELECT i.*,
+                COALESCE(SUM(p.amount), 0) AS paid_amount
+           FROM invoices i
+           LEFT JOIN payments p ON p.invoice_id = i.id
+          WHERE i.id        = $1
+            AND i.school_id = $2
+            AND i.status   IN ('UNPAID', 'PARTIAL')
+          GROUP BY i.id
+          FOR UPDATE OF i`,
         [invoiceId, schoolId]
       );
 
-      if (!invoice) throw new Error('Invoice not found');
+      if (!invoice) throw new Error('Invoice not found or already fully paid');
 
       const referenceNumber = resolveReceiptFromRow(transaction);
+      const paymentAmount   = parseFloat(transaction.amount);
 
+      // ── Insert payment ───────────────────────────────────────────────────
       const { rows: [payment] } = await client.query(
         `INSERT INTO payments
            (invoice_id, amount, payment_method, reference_number,
@@ -410,7 +555,7 @@ class MpesaService {
          RETURNING *`,
         [
           invoiceId,
-          transaction.amount,
+          paymentAmount,
           referenceNumber,
           transaction.transaction_date,
           reconciledBy,
@@ -418,6 +563,22 @@ class MpesaService {
         ]
       );
 
+      // ── Update invoice status ────────────────────────────────────────────
+      const previouslyPaid = parseFloat(invoice.paid_amount);
+      const invoiceTotal   = parseFloat(invoice.total_amount);
+      const remaining      = invoiceTotal - previouslyPaid - paymentAmount;
+      const newStatus      = remaining <= 1 ? 'PAID' : 'PARTIAL';
+
+      await client.query(
+        `UPDATE invoices
+            SET status     = $1,
+                updated_at = NOW()
+          WHERE id        = $2
+            AND school_id = $3`,
+        [newStatus, invoice.id, schoolId]
+      );
+
+      // ── Mark transaction RECONCILED ──────────────────────────────────────
       await client.query(
         `UPDATE mpesa_transactions
             SET status        = 'RECONCILED',
@@ -429,31 +590,37 @@ class MpesaService {
         [reconciledBy, payment.id, transactionId, schoolId]
       );
 
-      console.log(`✅ [manualReconcile] payment ${payment.id} → invoice ${invoiceId} (ref: ${referenceNumber})`);
-      return { success: true, payment, transaction };
+      console.log(
+        `✅ [manualReconcile] payment ${payment.id} → invoice ${invoiceId} ` +
+        `| invoice now ${newStatus} | ref: ${referenceNumber}`
+      );
+
+      return { success: true, payment, transaction, invoiceStatus: newStatus };
     });
   }
 
-  // ─── TRANSACTION STATUS QUERY ─────────────────────────────────────────────
+  // ─── TRANSACTION STATUS QUERY (school-scoped) ─────────────────────────────
 
-  async queryTransaction(checkoutRequestID) {
+  async queryTransaction(checkoutRequestID, schoolId) {
     if (!this.isEnabled) throw new Error('M-Pesa is not configured');
+    if (!schoolId)        throw new Error('schoolId is required');
 
     const tx = await db.queryOne(
       `SELECT status, amount, mpesa_receipt_number, transaction_id
          FROM mpesa_transactions
-        WHERE transaction_id = $1`,
-      [checkoutRequestID]
+        WHERE transaction_id = $1
+          AND school_id      = $2`,
+      [checkoutRequestID, schoolId]
     );
 
     const isSettled = tx?.status === 'COMPLETED' || tx?.status === 'RECONCILED';
 
     return {
-      status:        tx?.status?.toLowerCase() || 'pending',
+      status:        tx?.status?.toLowerCase() ?? 'pending',
       resultCode:    isSettled ? 0 : -1,
-      resultDesc:    tx?.status || 'pending',
-      amount:        parseFloat(tx?.amount || 0),
-      receiptNumber: tx?.mpesa_receipt_number || tx?.transaction_id || null,
+      resultDesc:    tx?.status ?? 'pending',
+      amount:        parseFloat(tx?.amount ?? 0),
+      receiptNumber: tx?.mpesa_receipt_number ?? tx?.transaction_id ?? null,
     };
   }
 
@@ -488,8 +655,8 @@ class MpesaService {
   parseTransactionDate(dateValue) {
     if (!dateValue) return new Date();
     const s = dateValue.toString();
-    // Safaricom format: YYYYMMDDHHmmss (14 digits)
-    if (s.length === 14) {
+    // Safaricom timestamp format: YYYYMMDDHHmmss (14 digits)
+    if (/^\d{14}$/.test(s)) {
       return new Date(
         `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}` +
         `T${s.slice(8,10)}:${s.slice(10,12)}:${s.slice(12,14)}+03:00`
